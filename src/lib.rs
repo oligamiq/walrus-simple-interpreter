@@ -31,7 +31,7 @@ pub struct Interpreter {
     pub stack: Vec<Value>,
     /// The functions of the module. These are set up at the start of the
     /// module and are used to store the state of the module.
-    functions: HashMap<String, Box<dyn FnMut(&mut Interpreter, &[Value]) -> Result<Option<Value>>>>,
+    functions: HashMap<String, Box<dyn FnMut(&mut Interpreter, &[Value]) -> Result<Vec<Value>>>>,
     /// interrupt handler eval
     interrupt_handler: Option<
         Box<dyn FnMut(&mut Interpreter, &Instr, (FunctionId, InstrSeqId, usize)) -> Result<()>>,
@@ -112,7 +112,7 @@ impl Interpreter {
     pub fn add_function(
         &mut self,
         name: impl AsRef<str>,
-        func: impl FnMut(&mut Interpreter, &[Value]) -> Result<Option<Value>> + 'static,
+        func: impl FnMut(&mut Interpreter, &[Value]) -> Result<Vec<Value>> + 'static,
     ) {
         self.functions
             .insert(name.as_ref().to_string(), Box::new(func));
@@ -179,17 +179,16 @@ impl Interpreter {
         self.stack.push(value);
     }
 
+    fn stack_extend(&mut self, values: Vec<Value>) {
+        self.stack.extend(values);
+    }
+
     fn stack_tee(&self) -> Value {
         self.stack.last().cloned().unwrap()
     }
 
     /// Call a function in the module with the given arguments.
-    pub fn call(
-        &mut self,
-        id: FunctionId,
-        module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>> {
+    pub fn call(&mut self, id: FunctionId, module: &Module, args: &[Value]) -> Result<Vec<Value>> {
         let func = module.funcs.get(id);
         log::debug!("starting a call of {:?} {:?}", id, func.name);
         log::debug!("arguments {:?}", args);
@@ -216,20 +215,18 @@ impl Interpreter {
         let entry = local.entry_block();
         let block = local.block(entry);
 
+        assert_eq!(local.args.len(), args.len());
         let mut locals = BTreeMap::new();
+        for (arg, val) in local.args.iter().zip(args) {
+            locals.insert(*arg, *val);
+        }
 
         let mut frame = Frame {
             module,
             interp: self,
-            locals: &mut locals,
-            done: false,
+            locals,
             local_func: local,
         };
-
-        assert_eq!(local.args.len(), args.len());
-        for (arg, val) in local.args.iter().zip(args) {
-            frame.locals.insert(*arg, *val);
-        }
 
         for (i, (instr, _)) in block.instrs.iter().enumerate() {
             if let Err(err) = frame.eval(instr, (id, entry, i)) {
@@ -239,34 +236,52 @@ impl Interpreter {
                     bail!("{err}")
                 }
             }
-
-            if frame.done {
-                break;
-            }
         }
-        Ok(self.stack.last().cloned())
+        Ok(self.stack.clone())
     }
 }
 
-struct Frame<'a, 'b> {
+struct Frame<'a> {
     module: &'a Module,
     interp: &'a mut Interpreter,
     local_func: &'a LocalFunction,
-    locals: &'b mut BTreeMap<LocalId, Value>,
-    done: bool,
+    locals: BTreeMap<LocalId, Value>,
 }
 
-impl<'a, 'b> Frame<'a, 'b> {
-    fn eval(&mut self, instr: &Instr, id: (FunctionId, InstrSeqId, usize)) -> Result<()> {
+macro_rules! block {
+    (
+        $self:ident,
+        $id:ident,
+        $seq:expr
+    ) => {{
+        return $self.block($id, $seq);
+    }};
+}
+
+impl Frame<'_> {
+    fn eval(&mut self, instr: &Instr, place: (FunctionId, InstrSeqId, usize)) -> Result<BlockRet> {
         use walrus::ir::*;
 
-        self.interp.call_interrupt_handler(instr, id)?;
+        let id = place.0;
+
+        self.interp.call_interrupt_handler(instr, place)?;
 
         match instr {
             Instr::Const(Const { value }) => self.interp.stack_push(*value),
-            Instr::LocalGet(e) => self
-                .interp
-                .stack_push(self.locals.get(&e.local).cloned().unwrap()),
+            Instr::LocalGet(e) => {
+                self.interp
+                    .stack_push(self.locals.get(&e.local).cloned().unwrap_or_else(|| {
+                        let ty = self.module.locals.get(e.local).ty();
+                        match ty {
+                            ValType::I32 => Value::I32(0),
+                            ValType::I64 => Value::I64(0),
+                            ValType::F32 => Value::F32(0.0),
+                            ValType::F64 => Value::F64(0.0),
+                            _ => unreachable!(),
+                        }
+                    }))
+            }
+
             Instr::LocalSet(e) => {
                 let val = self.interp.stack_pop()?;
                 self.locals.insert(e.local, val);
@@ -357,11 +372,11 @@ impl<'a, 'b> Frame<'a, 'b> {
                 } else {
                     bail!("invalid address type for load");
                 };
+                let address = address as u32 + e.arg.offset;
                 ensure!(
                     address > 0,
                     "Read a negative address value from the stack. Did we run out of memory?"
                 );
-                let address = address as u32 + e.arg.offset;
                 ensure!(address % 4 == 0);
                 let value = self.interp.mem_get(e.memory, address);
                 let value = match e.kind {
@@ -386,11 +401,12 @@ impl<'a, 'b> Frame<'a, 'b> {
                 } else {
                     bail!("invalid address type for load");
                 };
+                let address = address as u32 + e.arg.offset;
+                println!("store address {:?}", address);
                 ensure!(
                     address > 0,
                     "Read a negative address value from the stack. Did we run out of memory?"
                 );
-                let address = address as u32 + e.arg.offset;
                 ensure!(address % 4 == 0);
                 match e.kind {
                     StoreKind::I32 { .. } => {
@@ -428,7 +444,8 @@ impl<'a, 'b> Frame<'a, 'b> {
 
             Instr::Return(_) => {
                 log::debug!("return");
-                self.done = true;
+
+                todo!();
             }
 
             Instr::Drop(_) => {
@@ -436,29 +453,30 @@ impl<'a, 'b> Frame<'a, 'b> {
                 self.interp.stack_pop()?;
             }
 
-            Instr::Call(Call { func }) | Instr::ReturnCall(ReturnCall { func }) => {
+            Instr::Call(Call { func }) => {
                 let func = *func;
 
                 let ty = self.module.types.get(self.module.funcs.get(func).ty());
-                let args = (0..ty.params().len())
-                    .map(|_| self.interp.stack_pop())
-                    .collect::<Result<Vec<_>>>()?;
+
+                let args = self
+                    .interp
+                    .stack
+                    .split_off(self.interp.stack.len() - ty.params().len());
 
                 let ret = self.interp.call(func, self.module, &args)?;
-                if let Some(ret) = ret {
-                    self.interp.stack_push(ret);
-                }
+                self.interp.stack.extend(ret);
             }
 
             Instr::Block(b) => {
                 log::debug!("block");
 
-                self.block(id.0, b.seq)?;
+                block!(self, id, b.seq);
             }
 
             Instr::Loop(l) => {
                 log::debug!("loop");
-                self.block(id.0, l.seq)?;
+
+                block!(self, id, l.seq);
             }
 
             Instr::BrIf(i) => {
@@ -470,13 +488,17 @@ impl<'a, 'b> Frame<'a, 'b> {
                     bail!("invalid value type for br_if");
                 };
                 if val != 0 {
-                    self.block(id.0, i.block)?;
+                    return Ok(BlockRet::Break {
+                        break_point: i.block,
+                    });
                 }
             }
 
             Instr::Br(i) => {
                 log::debug!("br");
-                self.block(id.0, i.block)?;
+                return Ok(BlockRet::Break {
+                    break_point: i.block,
+                });
             }
 
             Instr::IfElse(i) => {
@@ -488,9 +510,31 @@ impl<'a, 'b> Frame<'a, 'b> {
                     bail!("invalid value type for if_else");
                 };
                 if val != 0 {
-                    self.block(id.0, i.consequent)?;
+                    block!(self, id, i.consequent);
                 } else {
-                    self.block(id.0, i.alternative)?;
+                    block!(self, id, i.alternative);
+                }
+            }
+
+            Instr::Select(i) => {
+                log::debug!("select");
+
+                if i.ty.is_some() {
+                    todo!("select with type");
+                }
+
+                let val = self.interp.stack_pop()?;
+                let val = if let Value::I32(val) = val {
+                    val
+                } else {
+                    bail!("invalid value type for select");
+                };
+                let b = self.interp.stack_pop()?;
+                let a = self.interp.stack_pop()?;
+                if val != 0 {
+                    self.interp.stack_push(a);
+                } else {
+                    self.interp.stack_push(b);
                 }
             }
 
@@ -506,17 +550,49 @@ impl<'a, 'b> Frame<'a, 'b> {
             s => bail!("unknown instruction {:?}", s),
         }
 
-        Ok(())
+        Ok(BlockRet::Success)
     }
 
-    fn block(&mut self, function_id: FunctionId, instr_sec_id: InstrSeqId) -> Result<()> {
+    fn block(&mut self, function_id: FunctionId, instr_sec_id: InstrSeqId) -> Result<BlockRet> {
+        let unwind_stack_height = self.interp.stack.len();
         let block = self.local_func.block(instr_sec_id);
         for (i, (instr, _)) in block.instrs.iter().enumerate() {
-            self.eval(instr, (function_id, instr_sec_id, i))?;
-            if self.done {
-                return Ok(());
+            let ret = self.eval(instr, (function_id, instr_sec_id, i))?;
+            if let BlockRet::Break { break_point } = ret {
+                if break_point == break_point {
+                    let block_ty = match block.ty {
+                        InstrSeqType::Simple(val_type) => {
+                            val_type.map(|v| vec![v]).unwrap_or_default()
+                        }
+                        InstrSeqType::MultiValue(id) => {
+                            let ty = self.module.types.get(id);
+                            println!("block ty {:?}", ty);
+                            // ty.results().iter().map(|v| *v).collect()
+
+                            todo!()
+                        }
+                    };
+
+                    let ret = self
+                        .interp
+                        .stack
+                        .split_off(self.interp.stack.len() - block_ty.len());
+
+                    self.interp.stack.truncate(unwind_stack_height);
+
+                    self.interp.stack.extend(ret);
+
+                    return Ok(BlockRet::Success);
+                }
+
+                return Ok(ret);
             }
         }
-        Ok(())
+        Ok(BlockRet::Success)
     }
+}
+
+enum BlockRet {
+    Success,
+    Break { break_point: InstrSeqId },
 }
