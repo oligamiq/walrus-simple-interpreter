@@ -1,0 +1,15 @@
+[package]
+name = "walrus-simple-interpreter"
+version = "0.1.0"
+edition = "2024"
+description = "A simple interpreter for WebAssembly using the Walrus library."
+homepage = "https://github.com/oligamiq/walrus-simple-interpreter"
+repository = "https://github.com/oligamiq/walrus-simple-interpreter"
+license = "MIT OR Apache-2.0"
+authors = ["oligami <nziq53@gmail.com> (https://github.com/oligamiq)"]
+keywords = ["wasm", "interpreter", "walrus", "webassembly", "simple"]
+
+[dependencies]
+anyhow = "1.0.98"
+log = "0.4.27"
+walrus = "0.23.3"
