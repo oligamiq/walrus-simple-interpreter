@@ -171,8 +171,8 @@ impl Interpreter {
         mem.insert(address, value);
     }
 
-    fn stack_pop(&mut self) -> Value {
-        self.stack.pop().unwrap()
+    fn stack_pop(&mut self) -> Result<Value> {
+        self.stack.pop().with_context(|| "stack underflow")
     }
 
     fn stack_push(&mut self, value: Value) {
@@ -268,7 +268,7 @@ impl<'a, 'b> Frame<'a, 'b> {
                 .interp
                 .stack_push(self.locals.get(&e.local).cloned().unwrap()),
             Instr::LocalSet(e) => {
-                let val = self.interp.stack_pop();
+                let val = self.interp.stack_pop()?;
                 self.locals.insert(e.local, val);
             }
             Instr::LocalTee(e) => {
@@ -280,15 +280,15 @@ impl<'a, 'b> Frame<'a, 'b> {
                 .interp
                 .stack_push(self.interp.globals.get(&e.global).cloned().unwrap()),
             Instr::GlobalSet(e) => {
-                let val = self.interp.stack_pop();
+                let val = self.interp.stack_pop()?;
                 *self.interp.globals.get_mut(&e.global).unwrap() = val;
             }
 
             // Support simple arithmetic, mainly for the stack pointer
             // manipulation
             Instr::Binop(e) => {
-                let rhs = self.interp.stack_pop();
-                let lhs = self.interp.stack_pop();
+                let rhs = self.interp.stack_pop()?;
+                let lhs = self.interp.stack_pop()?;
                 match (rhs, lhs) {
                     (Value::I32(rhs), Value::I32(lhs)) => {
                         self.interp.stack_push(Value::I32(match e.op {
@@ -331,11 +331,27 @@ impl<'a, 'b> Frame<'a, 'b> {
                 }
             }
 
+            Instr::Unop(e) => {
+                let val = self.interp.stack_pop()?;
+                match val {
+                    Value::I32(val) => {
+                        self.interp.stack_push(Value::I32(match e.op {
+                            UnaryOp::I32Clz => val.leading_zeros() as i32,
+                            UnaryOp::I32Ctz => val.trailing_zeros() as i32,
+                            UnaryOp::I32Popcnt => val.count_ones() as i32,
+                            UnaryOp::I32Eqz => (val == 0) as i32,
+                            op => bail!("invalid unary op {:?}", op),
+                        }));
+                    }
+                    _ => bail!("invalid types for unary op"),
+                }
+            }
+
             // Support small loads/stores to the stack. These show up in debug
             // mode where there's some traffic on the linear stack even when in
             // theory there doesn't need to be.
             Instr::Load(e) => {
-                let address = self.interp.stack_pop();
+                let address = self.interp.stack_pop()?;
                 let address = if let Value::I32(address) = address {
                     address
                 } else {
@@ -363,8 +379,8 @@ impl<'a, 'b> Frame<'a, 'b> {
                 self.interp.stack_push(value);
             }
             Instr::Store(e) => {
-                let value = self.interp.stack_pop();
-                let address = self.interp.stack_pop();
+                let value = self.interp.stack_pop()?;
+                let address = self.interp.stack_pop()?;
                 let address = if let Value::I32(address) = address {
                     address
                 } else {
@@ -417,7 +433,7 @@ impl<'a, 'b> Frame<'a, 'b> {
 
             Instr::Drop(_) => {
                 log::debug!("drop");
-                self.interp.stack_pop();
+                self.interp.stack_pop()?;
             }
 
             Instr::Call(Call { func }) | Instr::ReturnCall(ReturnCall { func }) => {
@@ -426,13 +442,11 @@ impl<'a, 'b> Frame<'a, 'b> {
                 let ty = self.module.types.get(self.module.funcs.get(func).ty());
                 let args = (0..ty.params().len())
                     .map(|_| self.interp.stack_pop())
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
 
-                self.interp.call(func, self.module, &args)?;
-
-                if let Instr::ReturnCall(_) = instr {
-                    log::debug!("return_call");
-                    self.done = true;
+                let ret = self.interp.call(func, self.module, &args)?;
+                if let Some(ret) = ret {
+                    self.interp.stack_push(ret);
                 }
             }
 
@@ -449,27 +463,25 @@ impl<'a, 'b> Frame<'a, 'b> {
 
             Instr::BrIf(i) => {
                 log::debug!("br_if");
-                let val = self.interp.stack_pop();
+                let val = self.interp.stack_pop()?;
                 let val = if let Value::I32(val) = val {
                     val
                 } else {
                     bail!("invalid value type for br_if");
                 };
                 if val != 0 {
-                    self.done = true;
                     self.block(id.0, i.block)?;
                 }
             }
 
             Instr::Br(i) => {
                 log::debug!("br");
-                self.done = true;
                 self.block(id.0, i.block)?;
             }
 
             Instr::IfElse(i) => {
                 log::debug!("if_else");
-                let val = self.interp.stack_pop();
+                let val = self.interp.stack_pop()?;
                 let val = if let Value::I32(val) = val {
                     val
                 } else {
@@ -502,7 +514,7 @@ impl<'a, 'b> Frame<'a, 'b> {
         for (i, (instr, _)) in block.instrs.iter().enumerate() {
             self.eval(instr, (function_id, instr_sec_id, i))?;
             if self.done {
-                break;
+                return Ok(());
             }
         }
         Ok(())
