@@ -1,6 +1,6 @@
 [package]
 name = "walrus-simple-interpreter"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A simple interpreter for WebAssembly using the Walrus library."
 homepage = "https://github.com/oligamiq/walrus-simple-interpreter"
