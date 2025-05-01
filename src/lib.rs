@@ -192,8 +192,6 @@ impl Interpreter {
         let mut interrupt_handler = self.interrupt_handler.take();
         if let Some(ref mut handler) = interrupt_handler {
             handler(self, instr, id)?;
-        } else {
-            bail!("no interrupt handler set");
         }
 
         self.interrupt_handler = interrupt_handler;
@@ -211,8 +209,6 @@ impl Interpreter {
         let mut interrupt_handler = self.interrupt_handler_mem.take();
         if let Some(ref mut handler) = interrupt_handler {
             handler(self, instr, id, mem)?;
-        } else {
-            bail!("no interrupt handler set");
         }
 
         self.interrupt_handler_mem = interrupt_handler;
