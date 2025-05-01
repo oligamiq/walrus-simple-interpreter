@@ -36,7 +36,34 @@ pub struct Interpreter {
     interrupt_handler: Option<
         Box<dyn FnMut(&mut Interpreter, &Instr, (FunctionId, InstrSeqId, usize)) -> Result<()>>,
     >,
+    /// interrupt handler mem access
+    /// (&mut interpreter, &instr, (function_id, instr_seq_id, i), (memory_id, address, value, access_type))
+    /// Called after the change
+    interrupt_handler_mem: Option<
+        Box<
+            dyn FnMut(
+                &mut Interpreter,
+                &Instr,
+                (FunctionId, InstrSeqId, usize),
+                (MemoryId, u32, Value, MemoryAccessType),
+            ) -> Result<()>,
+        >,
+    >,
+
     init_memories: BTreeMap<MemoryId, Box<[(usize, Box<[u8]>)]>>,
+
+    /// The size of the memory of the module. This is set up at the start of
+    /// the module and is used to store the state of the module.
+    /// pages per 64kiB
+    pub memory_size: BTreeMap<MemoryId, usize>,
+}
+
+/// The type of memory access.
+pub enum MemoryAccessType {
+    /// Memory load access.
+    Load,
+    /// Memory store access.
+    Store,
 }
 
 impl Interpreter {
@@ -97,14 +124,28 @@ impl Interpreter {
             .map(|mem| (mem.id(), BTreeMap::new()))
             .collect::<BTreeMap<_, _>>();
 
+        let memory_size = module
+            .memories
+            .iter()
+            .map(|mem| (mem.id(), mem.initial as usize))
+            .collect::<BTreeMap<_, _>>();
+
         Ok(Self {
             globals,
             mem,
             stack: Vec::with_capacity(256),
             functions: HashMap::new(),
             interrupt_handler: None,
+            interrupt_handler_mem: None,
             init_memories,
+            memory_size,
         })
+    }
+
+    /// Set the value
+    pub fn mem_set_i32(&mut self, id: MemoryId, address: u32, value: i32) -> Result<()> {
+        let value = u32::to_le_bytes(value as u32);
+        Ok(self.mem_set(id, address, value))
     }
 
     /// Add a function to the interpreter. This function will be called
@@ -127,6 +168,21 @@ impl Interpreter {
         self.interrupt_handler = Some(Box::new(handler));
     }
 
+    /// Add a function to the interpreter. This function will be called
+    /// whenever the interpreter encounters a call to it.
+    pub fn set_interrupt_handler_mem(
+        &mut self,
+        handler: impl FnMut(
+            &mut Interpreter,
+            &Instr,
+            (FunctionId, InstrSeqId, usize),
+            (MemoryId, u32, Value, MemoryAccessType),
+        ) -> Result<()>
+        + 'static,
+    ) {
+        self.interrupt_handler_mem = Some(Box::new(handler));
+    }
+
     /// Call the interrupt handler. This will call the interrupt handler
     pub fn call_interrupt_handler(
         &mut self,
@@ -145,6 +201,26 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Call the interrupt handler. This will call the interrupt handler
+    pub fn call_interrupt_handler_mem(
+        &mut self,
+        instr: &Instr,
+        id: (FunctionId, InstrSeqId, usize),
+        mem: (MemoryId, u32, Value, MemoryAccessType),
+    ) -> Result<()> {
+        let mut interrupt_handler = self.interrupt_handler_mem.take();
+        if let Some(ref mut handler) = interrupt_handler {
+            handler(self, instr, id, mem)?;
+        } else {
+            bail!("no interrupt handler set");
+        }
+
+        self.interrupt_handler_mem = interrupt_handler;
+
+        Ok(())
+    }
+
+    #[allow(unused)]
     fn mem_get(&mut self, id: MemoryId, address: u32) -> [u8; 4] {
         let address = address as usize;
 
@@ -165,24 +241,29 @@ impl Interpreter {
         })
     }
 
+    #[allow(unused)]
     fn mem_set(&mut self, id: MemoryId, address: u32, value: [u8; 4]) {
         let address = address as usize;
         let mem = self.mem.get_mut(&id).unwrap();
         mem.insert(address, value);
     }
 
+    #[allow(unused)]
     fn stack_pop(&mut self) -> Result<Value> {
         self.stack.pop().with_context(|| "stack underflow")
     }
 
+    #[allow(unused)]
     fn stack_push(&mut self, value: Value) {
         self.stack.push(value);
     }
 
+    #[allow(unused)]
     fn stack_extend(&mut self, values: Vec<Value>) {
         self.stack.extend(values);
     }
 
+    #[allow(unused)]
     fn stack_tee(&self) -> Value {
         self.stack.last().cloned().unwrap()
     }
@@ -229,11 +310,30 @@ impl Interpreter {
         };
 
         for (i, (instr, _)) in block.instrs.iter().enumerate() {
-            if let Err(err) = frame.eval(instr, (id, entry, i)) {
-                if let Some(name) = &module.funcs.get(id).name {
-                    bail!("{name}: {err}")
-                } else {
-                    bail!("{err}")
+            match frame.eval(instr, (id, entry, i)) {
+                Ok(BlockRet::Success) => {}
+                Ok(BlockRet::Break { .. }) => unreachable!(),
+                Ok(BlockRet::Return) => {
+                    let ty = match block.ty {
+                        InstrSeqType::Simple(val_type) => {
+                            val_type.map(|v| vec![v]).unwrap_or_default()
+                        }
+                        InstrSeqType::MultiValue(id) => {
+                            let ty = module.types.get(id);
+                            ty.results().iter().map(|v| *v).collect()
+                        }
+                    };
+                    let ret = self.stack.split_off(self.stack.len() - ty.len());
+                    self.stack.clear();
+
+                    return Ok(ret);
+                }
+                Err(err) => {
+                    if let Some(name) = &module.funcs.get(id).name {
+                        bail!("{name}: {err}")
+                    } else {
+                        bail!("{err}")
+                    }
                 }
             }
         }
@@ -261,6 +361,14 @@ macro_rules! block {
 impl Frame<'_> {
     fn eval(&mut self, instr: &Instr, place: (FunctionId, InstrSeqId, usize)) -> Result<BlockRet> {
         use walrus::ir::*;
+
+        fn as_u32(v: i32) -> u32 {
+            unsafe { std::mem::transmute(v) }
+        }
+
+        fn as_i32(v: u32) -> i32 {
+            unsafe { std::mem::transmute(v) }
+        }
 
         let id = place.0;
 
@@ -310,38 +418,39 @@ impl Frame<'_> {
                             BinaryOp::I32Sub => lhs - rhs,
                             BinaryOp::I32Add => lhs + rhs,
                             BinaryOp::I32Mul => lhs * rhs,
-                            BinaryOp::I32DivU => lhs / rhs,
+                            BinaryOp::I32DivU => as_i32(as_u32(lhs) / as_u32(rhs)),
                             BinaryOp::I32DivS => lhs / rhs,
-                            BinaryOp::I32RemU => lhs % rhs,
+                            BinaryOp::I32RemU => as_i32(as_u32(lhs) % as_u32(rhs)),
                             BinaryOp::I32RemS => lhs % rhs,
                             BinaryOp::I32And => lhs & rhs,
                             BinaryOp::I32Or => lhs | rhs,
                             BinaryOp::I32Xor => lhs ^ rhs,
                             BinaryOp::I32Shl => lhs << rhs,
-                            BinaryOp::I32ShrU => lhs >> rhs,
+                            BinaryOp::I32ShrU => as_i32(as_u32(lhs) >> as_u32(rhs)),
                             BinaryOp::I32ShrS => lhs >> rhs,
                             BinaryOp::I32Rotl => lhs.rotate_left(rhs as u32),
                             BinaryOp::I32Rotr => lhs.rotate_right(rhs as u32),
                             BinaryOp::I32Eq => (lhs == rhs) as i32,
                             BinaryOp::I32Ne => (lhs != rhs) as i32,
-                            BinaryOp::I32LtU => (lhs < rhs) as i32,
+                            BinaryOp::I32LtU => (as_u32(lhs) < as_u32(rhs)) as i32,
                             BinaryOp::I32LtS => (lhs < rhs) as i32,
-                            BinaryOp::I32GtU => (lhs > rhs) as i32,
+                            BinaryOp::I32GtU => (as_u32(lhs) > as_u32(rhs)) as i32,
                             BinaryOp::I32GtS => (lhs > rhs) as i32,
-                            BinaryOp::I32LeU => (lhs <= rhs) as i32,
+                            BinaryOp::I32LeU => (as_u32(lhs) <= as_u32(rhs)) as i32,
                             BinaryOp::I32LeS => (lhs <= rhs) as i32,
-                            BinaryOp::I32GeU => (lhs >= rhs) as i32,
+                            BinaryOp::I32GeU => (as_u32(lhs) >= as_u32(rhs)) as i32,
                             BinaryOp::I32GeS => (lhs >= rhs) as i32,
                             op => bail!("invalid binary op {:?}", op),
                         }));
                     }
-                    (Value::I64(rhs), Value::I64(lhs)) => {
-                        self.interp.stack_push(Value::I64(match e.op {
-                            BinaryOp::I64Sub => lhs - rhs,
-                            BinaryOp::I64Add => lhs + rhs,
-                            op => bail!("invalid binary op {:?}", op),
-                        }));
-                    }
+                    (Value::I64(rhs), Value::I64(lhs)) => match e.op {
+                        BinaryOp::I64Sub => self.interp.stack_push(Value::I64(lhs - rhs)),
+                        BinaryOp::I64Add => self.interp.stack_push(Value::I64(lhs + rhs)),
+                        BinaryOp::I64Eq => {
+                            self.interp.stack_push(Value::I32((lhs == rhs) as i32));
+                        }
+                        op => bail!("invalid binary op {:?}", op),
+                    },
                     _ => bail!("invalid types for binary op"),
                 }
             }
@@ -355,6 +464,12 @@ impl Frame<'_> {
                             UnaryOp::I32Ctz => val.trailing_zeros() as i32,
                             UnaryOp::I32Popcnt => val.count_ones() as i32,
                             UnaryOp::I32Eqz => (val == 0) as i32,
+                            op => bail!("invalid unary op {:?}", op),
+                        }));
+                    }
+                    Value::I64(val) => {
+                        self.interp.stack_push(Value::I32(match e.op {
+                            UnaryOp::I64Eqz => (val == 0) as i32,
                             op => bail!("invalid unary op {:?}", op),
                         }));
                     }
@@ -389,8 +504,23 @@ impl Frame<'_> {
                     }
                     LoadKind::F32 => todo!(),
                     LoadKind::F64 => todo!(),
+                    LoadKind::I32_8 { kind } => {
+                        let value = i32::from_le_bytes([value[0], 0, 0, 0]);
+                        let value = match kind {
+                            ExtendedLoad::SignExtend => value,
+                            ExtendedLoad::ZeroExtend => value as u32 as i32,
+                            ExtendedLoad::ZeroExtendAtomic => value as u32 as i32,
+                        };
+                        Value::I32(value)
+                    }
                     _ => bail!("no support for this load kind"),
                 };
+
+                self.interp.call_interrupt_handler_mem(
+                    instr,
+                    place,
+                    (e.memory, address, value, MemoryAccessType::Load),
+                )?;
                 self.interp.stack_push(value);
             }
             Instr::Store(e) => {
@@ -416,16 +546,26 @@ impl Frame<'_> {
                             bail!("invalid value type for store");
                         };
                         let v = u32::to_le_bytes(value as u32);
+                        self.interp.call_interrupt_handler_mem(
+                            instr,
+                            place,
+                            (
+                                e.memory,
+                                address,
+                                Value::I32(value),
+                                MemoryAccessType::Store,
+                            ),
+                        )?;
                         self.interp.mem_set(e.memory, address, v);
                     }
                     StoreKind::I64 { .. } => {
-                        let value = if let Value::I64(value) = value {
+                        let v = if let Value::I64(value) = value {
                             value
                         } else {
                             bail!("invalid value type for store");
                         };
-                        let value = u64::to_le_bytes(value as u64);
-                        let v = value.chunks(4).map(|chunk| {
+                        let v = u64::to_le_bytes(v as u64);
+                        let v = v.chunks(4).map(|chunk| {
                             let mut arr = [0; 4];
                             arr.copy_from_slice(chunk);
                             arr
@@ -435,6 +575,11 @@ impl Frame<'_> {
                             self.interp.mem_set(e.memory, address + i, chunk);
                             i += 4;
                         }
+                        self.interp.call_interrupt_handler_mem(
+                            instr,
+                            place,
+                            (e.memory, address, value, MemoryAccessType::Store),
+                        )?;
                     }
                     StoreKind::F32 => todo!(),
                     StoreKind::F64 => todo!(),
@@ -445,7 +590,7 @@ impl Frame<'_> {
             Instr::Return(_) => {
                 log::debug!("return");
 
-                todo!();
+                return Ok(BlockRet::Return);
             }
 
             Instr::Drop(_) => {
@@ -476,7 +621,17 @@ impl Frame<'_> {
             Instr::Loop(l) => {
                 log::debug!("loop");
 
-                block!(self, id, l.seq);
+                loop {
+                    match self.block(id, l.seq)? {
+                        BlockRet::Success => return Ok(BlockRet::Success),
+                        BlockRet::Break { break_point } => {
+                            if break_point != l.seq {
+                                return Ok(BlockRet::Break { break_point });
+                            }
+                        }
+                        BlockRet::Return => return Ok(BlockRet::Return),
+                    }
+                }
             }
 
             Instr::BrIf(i) => {
@@ -538,6 +693,34 @@ impl Frame<'_> {
                 }
             }
 
+            Instr::MemorySize(i) => {
+                log::debug!("memory size");
+                let id = i.memory;
+                let size = self.interp.memory_size.get(&id).unwrap();
+                self.interp.stack_push(Value::I32(*size as i32));
+            }
+
+            Instr::MemoryGrow(i) => {
+                log::debug!("memory grow");
+                let id = i.memory;
+                let size = *self.interp.memory_size.get(&id).unwrap();
+                let val = self.interp.stack_pop()?;
+                let val = if let Value::I32(val) = val {
+                    val
+                } else {
+                    bail!("invalid value type for memory grow");
+                };
+                if val < 0 {
+                    bail!("invalid value for memory grow");
+                }
+                self.interp.memory_size.insert(id, size + val as usize);
+            }
+
+            Instr::Unreachable(_) => {
+                log::debug!("unreachable");
+                bail!("unreachable");
+            }
+
             // All other instructions shouldn't be used by our various
             // descriptor functions. LLVM optimizations may mean that some
             // of the above instructions aren't actually needed either, but
@@ -566,10 +749,7 @@ impl Frame<'_> {
                         }
                         InstrSeqType::MultiValue(id) => {
                             let ty = self.module.types.get(id);
-                            println!("block ty {:?}", ty);
-                            // ty.results().iter().map(|v| *v).collect()
-
-                            todo!()
+                            ty.results().iter().map(|v| *v).collect()
                         }
                     };
 
@@ -580,7 +760,7 @@ impl Frame<'_> {
 
                     self.interp.stack.truncate(unwind_stack_height);
 
-                    self.interp.stack.extend(ret);
+                    self.interp.stack_extend(ret);
 
                     return Ok(BlockRet::Success);
                 }
@@ -595,4 +775,5 @@ impl Frame<'_> {
 enum BlockRet {
     Success,
     Break { break_point: InstrSeqId },
+    Return,
 }

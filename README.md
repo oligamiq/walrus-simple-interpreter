@@ -4,7 +4,7 @@ This dependents walrus, anyhow, log only.
 - call func with virtual system per eval operation
 - register import func
 - Coverage of some instruction. If not enough, we recommend pull-request.
-- only 500 code lines
+- only 700 code lines
 - used by my [other project](https://github.com/oligamiq/wasip1-vfs)
 
 ```rust
