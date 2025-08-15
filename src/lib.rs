@@ -245,6 +245,19 @@ impl Interpreter {
     }
 
     #[allow(unused)]
+    fn mem_set_u8(&mut self, id: MemoryId, address: u32, value: u8) {
+        let address = address as usize;
+        let mem = self.mem.get_mut(&id).unwrap();
+        if let Some(entry) = mem.get_mut(&address) {
+            entry[0] = value;
+        } else {
+            let mut entry = [0; 4];
+            entry[0] = value;
+            mem.insert(address, entry);
+        }
+    }
+
+    #[allow(unused)]
     fn stack_pop(&mut self) -> Result<Value> {
         self.stack.pop().with_context(|| "stack underflow")
     }
@@ -445,9 +458,10 @@ impl Frame<'_> {
                         BinaryOp::I64Eq => {
                             self.interp.stack_push(Value::I32((lhs == rhs) as i32));
                         }
+                        BinaryOp::I64Or => self.interp.stack_push(Value::I64(lhs | rhs)),
                         op => bail!("invalid binary op {:?}", op),
                     },
-                    _ => bail!("invalid types for binary op"),
+                    v => bail!("invalid types for binary op: {v:?}\ne: {e:?}"),
                 }
             }
 
@@ -455,13 +469,16 @@ impl Frame<'_> {
                 let val = self.interp.stack_pop()?;
                 match val {
                     Value::I32(val) => {
-                        self.interp.stack_push(Value::I32(match e.op {
-                            UnaryOp::I32Clz => val.leading_zeros() as i32,
-                            UnaryOp::I32Ctz => val.trailing_zeros() as i32,
-                            UnaryOp::I32Popcnt => val.count_ones() as i32,
-                            UnaryOp::I32Eqz => (val == 0) as i32,
+                        self.interp.stack_push(match e.op {
+                            UnaryOp::I32Clz => Value::I32(val.leading_zeros() as i32),
+                            UnaryOp::I32Ctz => Value::I32(val.trailing_zeros() as i32),
+                            UnaryOp::I32Popcnt => Value::I32(val.count_ones() as i32),
+                            UnaryOp::I32Eqz => Value::I32((val == 0) as i32),
+                            // The extend instructions, are used to convert (extend) numbers of type i32 to type i64.
+                            // There are signed and unsigned versions of this instruction.
+                            UnaryOp::I64ExtendUI32 => Value::I64((val as u32) as i64),
                             op => bail!("invalid unary op {:?}", op),
-                        }));
+                        });
                     }
                     Value::I64(val) => {
                         self.interp.stack_push(Value::I32(match e.op {
@@ -509,7 +526,7 @@ impl Frame<'_> {
                         };
                         Value::I32(value)
                     }
-                    _ => bail!("no support for this load kind"),
+                    variant => bail!("no support for this load kind: {variant:?}"),
                 };
 
                 self.interp.call_interrupt_handler_mem(
@@ -553,6 +570,27 @@ impl Frame<'_> {
                         )?;
                         self.interp.mem_set(e.memory, address, v);
                     }
+                    // store a 32-bit number into an 8-bit slot in memory using i32.store8
+                    // If the number doesn't fit in the narrower number type it will wrap.
+                    StoreKind::I32_8 { .. } => {
+                        let value = if let Value::I32(value) = value {
+                            value
+                        } else {
+                            bail!("invalid value type for store");
+                        };
+                        let v = u32::to_le_bytes(value as u32)[0];
+                        self.interp.call_interrupt_handler_mem(
+                            instr,
+                            place,
+                            (
+                                e.memory,
+                                address,
+                                Value::I32(value),
+                                MemoryAccessType::Store,
+                            ),
+                        )?;
+                        self.interp.mem_set_u8(e.memory, address, v);
+                    }
                     StoreKind::I64 { .. } => {
                         let v = if let Value::I64(value) = value {
                             value
@@ -578,7 +616,7 @@ impl Frame<'_> {
                     }
                     StoreKind::F32 => todo!(),
                     StoreKind::F64 => todo!(),
-                    _ => bail!("no support for this store kind"),
+                    v => bail!("no support for this store kind: {v:?}"),
                 };
             }
 
