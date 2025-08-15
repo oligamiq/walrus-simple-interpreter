@@ -29,6 +29,9 @@ pub struct Interpreter {
     /// The stack of the module. This is set up at the start of the
     /// module and is used to store the state of the module.
     pub stack: Vec<Value>,
+    /// The tables of the module. These are set up at the start of the
+    /// module and are used to store the state of the module.
+    pub tables: BTreeMap<TableId, Vec<FunctionId>>,
     /// The functions of the module. These are set up at the start of the
     /// module and are used to store the state of the module.
     functions: HashMap<String, Box<dyn FnMut(&mut Interpreter, &[Value]) -> Result<Vec<Value>>>>,
@@ -130,11 +133,54 @@ impl Interpreter {
             .map(|mem| (mem.id(), mem.initial as usize))
             .collect::<BTreeMap<_, _>>();
 
+        let tables = module
+            .tables
+            .iter()
+            .map(|table| {
+                (table.id(), {
+                    let mut vec = Vec::with_capacity(table.initial as usize);
+                    for elem_id in &table.elem_segments {
+                        let elem = module.elements.get(*elem_id);
+                        match elem.kind {
+                            walrus::ElementKind::Active { offset, .. } => {
+                                let offset = match offset {
+                                    ConstExpr::Value(ir::Value::I32(offset)) => offset as usize,
+                                    _ => {
+                                        log::warn!("Table segment {:?} is not i32", offset);
+                                        continue;
+                                    }
+                                };
+                                let items = match &elem.items {
+                                    ElementItems::Functions(ids) => ids,
+                                    ElementItems::Expressions(..) => todo!(),
+                                };
+
+                                if offset > vec.len() {
+                                    vec.resize(offset, items[0]);
+                                } else if offset < vec.len() {
+                                    vec.truncate(offset);
+                                }
+                                vec.extend(items);
+                            }
+                            walrus::ElementKind::Passive => {
+                                log::warn!("Table segment {:?} is passive", elem_id);
+                            }
+                            ElementKind::Declared => {
+                                todo!("Declared table segments are not supported")
+                            }
+                        }
+                    }
+                    vec
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(Self {
             globals,
             mem,
             stack: Vec::with_capacity(256),
             functions: HashMap::new(),
+            tables,
             interrupt_handler: None,
             interrupt_handler_mem: None,
             init_memories,
@@ -372,11 +418,17 @@ impl Frame<'_> {
         use walrus::ir::*;
 
         fn as_u32(v: i32) -> u32 {
-            unsafe { std::mem::transmute(v) }
+            #[allow(unnecessary_transmutes)]
+            unsafe {
+                core::mem::transmute(v)
+            }
         }
 
         fn as_i32(v: u32) -> i32 {
-            unsafe { std::mem::transmute(v) }
+            #[allow(unnecessary_transmutes)]
+            unsafe {
+                core::mem::transmute(v)
+            }
         }
 
         let id = place.0;
@@ -642,6 +694,36 @@ impl Frame<'_> {
                     .split_off(self.interp.stack.len() - ty.params().len());
 
                 let ret = self.interp.call(func, self.module, &args)?;
+                self.interp.stack.extend(ret);
+            }
+
+            Instr::CallIndirect(CallIndirect {
+                ty,
+                table: table_id,
+            }) => {
+                log::debug!("call_indirect");
+
+                let func_index = self.interp.stack_pop()?;
+                let table = self.interp.tables.get(table_id).unwrap();
+                let func_index = if let Value::I32(func_index) = func_index {
+                    func_index as usize
+                } else {
+                    bail!("invalid function index type for call_indirect");
+                };
+
+                ensure!(
+                    func_index < table.len(),
+                    "function index out of bounds for call_indirect"
+                );
+
+                let func_id = table[func_index];
+                let ty = self.module.types.get(*ty);
+                let args = self
+                    .interp
+                    .stack
+                    .split_off(self.interp.stack.len() - ty.params().len());
+
+                let ret = self.interp.call(func_id, self.module, &args)?;
                 self.interp.stack.extend(ret);
             }
 
