@@ -48,7 +48,7 @@ pub struct Interpreter {
                 &mut Interpreter,
                 &Instr,
                 (FunctionId, InstrSeqId, usize),
-                (MemoryId, u32, Value, MemoryAccessType),
+                (MemoryId, u64, Value, MemoryAccessType),
             ) -> Result<()>,
         >,
     >,
@@ -89,13 +89,13 @@ impl Interpreter {
         let init_memories = module
             .data
             .iter()
-            .filter_map(|data| match data.kind {
+            .filter_map(|data| match &data.kind {
                 walrus::DataKind::Active { memory, offset } => {
                     if let ConstExpr::Value(v) = offset {
                         if let ir::Value::I32(offset) = v {
                             Some((
-                                memory,
-                                (offset as usize, data.value.clone().into_boxed_slice()),
+                                *memory,
+                                (*offset as usize, data.value.clone().into_boxed_slice()),
                             ))
                         } else {
                             log::warn!("Data segment {:?} is not i32", offset);
@@ -141,10 +141,10 @@ impl Interpreter {
                     let mut vec = Vec::with_capacity(table.initial as usize);
                     for elem_id in &table.elem_segments {
                         let elem = module.elements.get(*elem_id);
-                        match elem.kind {
+                        match &elem.kind {
                             walrus::ElementKind::Active { offset, .. } => {
                                 let offset = match offset {
-                                    ConstExpr::Value(ir::Value::I32(offset)) => offset as usize,
+                                    ConstExpr::Value(ir::Value::I32(offset)) => *offset as usize,
                                     _ => {
                                         log::warn!("Table segment {:?} is not i32", offset);
                                         continue;
@@ -189,7 +189,7 @@ impl Interpreter {
     }
 
     /// Set the value
-    pub fn mem_set_i32(&mut self, id: MemoryId, address: u32, value: i32) -> Result<()> {
+    pub fn mem_set_i32(&mut self, id: MemoryId, address: u64, value: i32) -> Result<()> {
         let value = u32::to_le_bytes(value as u32);
         Ok(self.mem_set(id, address, value))
     }
@@ -222,7 +222,7 @@ impl Interpreter {
             &mut Interpreter,
             &Instr,
             (FunctionId, InstrSeqId, usize),
-            (MemoryId, u32, Value, MemoryAccessType),
+            (MemoryId, u64, Value, MemoryAccessType),
         ) -> Result<()>
         + 'static,
     ) {
@@ -250,7 +250,7 @@ impl Interpreter {
         &mut self,
         instr: &Instr,
         id: (FunctionId, InstrSeqId, usize),
-        mem: (MemoryId, u32, Value, MemoryAccessType),
+        mem: (MemoryId, u64, Value, MemoryAccessType),
     ) -> Result<()> {
         let mut interrupt_handler = self.interrupt_handler_mem.take();
         if let Some(ref mut handler) = interrupt_handler {
@@ -263,7 +263,7 @@ impl Interpreter {
     }
 
     #[allow(unused)]
-    fn mem_get(&mut self, id: MemoryId, address: u32) -> [u8; 4] {
+    fn mem_get(&mut self, id: MemoryId, address: u64) -> [u8; 4] {
         let address = address as usize;
 
         let mem = self.mem.get_mut(&id).unwrap();
@@ -284,14 +284,14 @@ impl Interpreter {
     }
 
     #[allow(unused)]
-    fn mem_set(&mut self, id: MemoryId, address: u32, value: [u8; 4]) {
+    fn mem_set(&mut self, id: MemoryId, address: u64, value: [u8; 4]) {
         let address = address as usize;
         let mem = self.mem.get_mut(&id).unwrap();
         mem.insert(address, value);
     }
 
     #[allow(unused)]
-    fn mem_set_u8(&mut self, id: MemoryId, address: u32, value: u8) {
+    fn mem_set_u8(&mut self, id: MemoryId, address: u64, value: u8) {
         let address = address as usize;
         let mem = self.mem.get_mut(&id).unwrap();
         if let Some(entry) = mem.get_mut(&address) {
@@ -552,7 +552,7 @@ impl Frame<'_> {
                 } else {
                     bail!("invalid address type for load");
                 };
-                let address = address as u32 + e.arg.offset;
+                let address = address as u64 + e.arg.offset;
                 ensure!(
                     address > 0,
                     "Read a negative address value from the stack. Did we run out of memory?"
@@ -596,7 +596,7 @@ impl Frame<'_> {
                 } else {
                     bail!("invalid address type for load");
                 };
-                let address = address as u32 + e.arg.offset;
+                let address = address as u64 + e.arg.offset;
                 ensure!(
                     address > 0,
                     "Read a negative address value from the stack. Did we run out of memory?"

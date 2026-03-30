@@ -10,6 +10,6 @@ authors = ["oligami <nziq53@gmail.com> (https://github.com/oligamiq)"]
 keywords = ["wasm", "interpreter", "walrus", "webassembly", "simple"]
 
 [dependencies]
-anyhow = "1.0.99"
-log = "0.4.27"
-walrus = "0.23.3"
+anyhow = "1.0.102"
+log = "0.4.29"
+walrus = "0.26.0"
